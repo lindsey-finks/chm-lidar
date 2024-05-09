@@ -1,0 +1,392 @@
+---
+title: "Canopy Height Modelling"
+author: "Lindsey Finks"
+format: html
+editor: visual
+---
+
+## Load packages
+
+```{r, warning=FALSE, results='hide', message=FALSE}
+library(tidyverse)
+library(lidR)
+library(raster)
+library(sf)
+library(sp)
+library(ggplot2) # for plotting
+library(ggspatial) # plotting spatial objects
+library(moments) # metrics (kurtosis, skewedness)
+library(corrplot)
+library(patchwork)
+
+setwd("C:/Users/lfink/Desktop/Spring 24 classes/Forestry Lidar Applications/Assignment 2 - CHM")
+
+set.seed(182)
+```
+
+Read in lidar file (LAZ): - USGS_LPC_VA_WV_MD_FEMA_REGION3_UTM18_2012 - Acquired from USGS 3DEP
+
+```{r}
+las_file <- readLAS("USGS_LPC_NC_Phase5_2018_A18_LA_37_10188718_.laz")
+
+summary(las_file)
+```
+
+## Subset lidar file, 200m rectangular plot
+
+```{r}
+# creates random sample of point
+random_point <- las_file[sample(nrow(las_file), 1), ]
+
+X <- random_point$X
+Y <- random_point$Y
+
+# Define a rectangular area around the random point
+buffer_distance <- 200
+xmin <- random_point$X - buffer_distance
+xmax <- random_point$X + buffer_distance
+ymin <- random_point$Y - buffer_distance
+ymax <- random_point$Y + buffer_distance
+
+# Create a rectangle object
+rectangle <- extent(xmin, xmax, ymin, ymax)
+
+# Clip the LiDAR data to the defined rectangle
+lassub <- clip_rectangle(las_file, xmin, ymin, xmax, ymax)
+```
+
+# Create digital terrain model
+
+I'm using the clipped plot from the original las file so my computer doesn't go bananas
+
+```{r}
+#Create digital terrain model
+dtm <- rasterize_terrain(lassub, res = 1, knnidw())
+
+# Normalize heights: 
+nlas <- normalize_height(lassub, tin(), dtm = dtm)
+
+# Set negative values to zero
+nlas$Z[nlas$Z < 0] <- 0
+
+# Plot distribution of ground points
+hist(filter_ground(nlas)$Z, main = "", xlab = "Elevation")
+
+```
+
+# Rasterize Canopy
+
+-   Algorithm: point to raster
+-   Subcircle: interpolate points within 15 cm
+-   Fill NA's using triangulation
+
+```{r}
+chm <- rasterize_canopy(nlas, res = 1, algorithm = p2r(subcircle = 0.15, na.fill =  tin()))
+
+plot(chm)
+```
+
+# ITD and Tree Segmentation
+
+I am using a local maximum filter with a fixed window size of 18 meters. This will look for neighbor points within a 9 meter radius to find the highest point of canopy.
+
+```{r}
+# Local Maximum Filter (LMF) for tree detection
+ttops <- find_trees(chm, lmf(18))
+
+# plot rasterized + tree tops
+plot(chm, col = height.colors(50))
+plot(ttops, add = TRUE, pch = 3)
+
+```
+
+# Create plot points, clip plots out of normalized lidar file
+
+I am not running this code chunk upon knitting as that would overwrite my sample plots.
+
+```{r, eval = FALSE}
+sample_plots <- list()
+random_points <- st_read("C:/Users/lfink/Desktop/Spring 24 classes/Forestry Lidar Applications/Assignment 2 - CHM/plot_points.shp") |> 
+  st_coordinates() |> 
+  as.data.frame()
+
+colnames(random_points) <- c("X", "Y")
+
+x <- 1:25
+
+# Sample 25 random points
+sample_size <- 25
+# random_points <- data.frame(X = sample(nlas$X, sample_size), 
+#                             Y = sample(nlas$Y, sample_size))
+# Create 25 plots
+for(i in 1:sample_size) {
+  # Extract the coordinates
+  x_coord <- random_points$X[i]
+  y_coord <- random_points$Y[i]
+  
+  # Create a circular plot with a radius of 15m
+  las_circ <- clip_circle(nlas, x_coord, y_coord, 15)
+  
+  # Store the CHM in the list
+  sample_plots[[i]] <- las_circ
+}
+
+```
+
+# Basic metrics
+
+```{r, eval = FALSE}
+sample_metrics <- data.frame(X = numeric(sample_size),
+                             Y = numeric(sample_size),
+                             Mean_Height = numeric(sample_size),
+                             Std_Dev = numeric(sample_size),
+                             Max_Height = numeric(sample_size),
+                             Height_90th_Percentile = numeric(sample_size),
+                             Skewness = numeric(sample_size),
+                             Kurtosis = numeric(sample_size),
+                             D1 = numeric(sample_size),
+                             D2 = numeric(sample_size),
+                             D3 = numeric(sample_size),
+                             D4 = numeric(sample_size),
+                             D5 = numeric(sample_size),
+                             D6 = numeric(sample_size),
+                             D7 = numeric(sample_size),
+                             D8 = numeric(sample_size),
+                             D9 = numeric(sample_size),
+                             D10 = numeric(sample_size))
+
+# Loop through each sample plot
+for (i in 1:sample_size) {
+  
+  # Extract the LiDAR point cloud
+  las <- sample_plots[[i]]
+  
+  # Calculate metrics
+  sample_metrics$X[i] <- las$X
+  sample_metrics$Y[i] <- las$Y
+  sample_metrics[i, "Mean_Height"] <- mean(las$Z)
+  sample_metrics[i, "Std_Dev"] <- sd(las$Z)
+  sample_metrics[i, "Max_Height"] <- max(las$Z)
+  sample_metrics[i, "Height_90th_Percentile"] <- quantile(las$Z, probs = 0.9)
+  sample_metrics[i, "Skewness"] <- skewness(las$Z)
+  sample_metrics[i, "Kurtosis"] <- kurtosis(las$Z)
+  
+  # Calculate density metrics
+  histogram <- hist(las$Z, breaks = 10, plot = FALSE)
+  density_metrics <- histogram$counts / sum(histogram$counts)
+  for (j in 1:10) {
+    sample_metrics[i, paste0("D", j)] <- density_metrics[j]
+  }
+}
+
+write_csv(sample_metrics, "sample_metrics.csv")
+```
+
+# Load sample plots and sample metrics
+
+```{r}
+sample_metrics <- read_csv("sample_metrics.csv")
+
+random_points <- st_read("C:/Users/lfink/Desktop/Spring 24 classes/Forestry Lidar Applications/Assignment 2 - CHM/plot_points.shp") |> 
+  st_coordinates() |> 
+  as.data.frame()
+
+plot(chm)
+points(random_points$X, random_points$Y)
+
+head(sample_metrics)
+```
+
+# Rasterize sample plot metrics
+
+```{r, eval = FALSE}
+output_dir <- "C:/Users/lfink/Desktop/Spring 24 classes/Forestry Lidar Applications/Assignment 2 - CHM/las"
+
+# Loop through each LAS object in the list
+for (i in seq_along(sample_plots)) {
+  # Define the output file path
+  output_file <- file.path(output_dir, paste0("plot_", i, ".las"))
+  
+  # Write the LAS object to the output file
+  writeLAS(sample_plots[[i]], output_file)
+}
+
+#Read in plots as a las catalog
+samples_ctg <- catalog(output_dir)
+
+las_r <- grid_metrics(samples_ctg, res = 1, ~mean(Z))
+
+plot(las_r)
+
+#Write out rasterized sample plots
+writeRaster(las_r, "rasterized_sampleplots.tif", overwrite=TRUE)
+
+#Write out point plots
+sample_points <- st_as_sf(sample_metrics, coords = c("X", "Y"))
+
+st_crs(sample_points) <- st_crs(2264)
+
+# Project the spatial points to EPSG:2264 (original projection):
+sample_points <- st_transform(sample_points, crs = 2264) 
+  
+st_write(sample_points, "plot_points.shp", append = FALSE)
+
+```
+
+## Aggregating 'ground truth' data or dependent variable for predictive model
+
+I am using net primary productivity (NPP) data from Landsat. This is a 30m resolution using the MODIS algorithm for annual NPP for the year 2018. NPP is measured as g C m2 / yr.
+
+# Preprocessing:
+
+I used google earth engine to filter for the year of my lidar acquisition date (2018) and clipped the image to the boundary of my study area. I brought the resulting image into ArcGIS pro and reprojected it to my study area's projection (NAD83 / North Carolina (ft US), EPSG: 2264). Then, I exported my sample plots, mapped them by their coordinates and ran the Zonal Statistics as Table tool to get derived values from the NPP data.
+
+# Read in NPP table, clean, and join to metrics data:
+
+```{r}
+npp <- read_csv("npp_zonal.csv") |> 
+  dplyr::select(MEAN, FID) |> 
+  rename("mean_npp" = MEAN,
+         "plotid" = FID) 
+
+#Divide NPP value by 10,000 (scale factor)
+npp$mean_npp <- npp$mean_npp/10000 
+
+metrics <- cbind(sample_metrics, npp)
+
+head(metrics)
+```
+
+# Exploring distributions of calibration and validation data
+
+I am using a correlation matrix and plotting individual variables against my predictor variable to explore distributions. From the correlation matrix, it seems that Skewness, Kurtosis, D5 and D6 metrics are correlated to the mean_npp value.
+
+```{r}
+corr_matrix <- metrics |> 
+  dplyr::select(-plotid, -X, -Y) |> 
+  cor()
+
+corrplot(corr_matrix, method = "square")
+
+meanht <- metrics |> 
+  ggplot(aes(x=mean_npp, y=Mean_Height)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  labs(x = "Mean NPP (gCm2/yr)",
+       y = "Mean height (ft)") +
+  theme_minimal()
+
+maxht <- metrics |> 
+  ggplot(aes(x=mean_npp, y=Max_Height)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  labs(x = "Mean NPP (gCm2/yr)",
+       y = "Max height (ft)") +
+  theme_minimal()
+
+D1 <- metrics |> 
+  ggplot(aes(x=mean_npp, y=D1)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  labs(x = "Mean NPP (gCm2/yr)",
+       y = "D1 Metrics (# of points)") +
+  theme_minimal()
+
+D8 <- metrics |> 
+  ggplot(aes(x=mean_npp, y=D8)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  labs(x = "Mean NPP (gCm2/yr)",
+       y = "D8 Metrics (# of points)") +
+  theme_minimal()
+
+meanht + maxht + D1 + D8
+
+```
+
+# Using a generalized linear model
+
+Maximum height, skewness and kurtosis are the predictor variables. I am setting the model family to Gaussian (normal) distribution assuming that the relationship between predictor variables and mean NPP is linear.
+
+```{r}
+glm_model <- glm(mean_npp ~ Max_Height + Skewness + Kurtosis, data = metrics, family = gaussian)
+
+summary(glm_model)
+```
+
+# Plotting Predicted NPP vs Actual Observed NPP
+
+Using the model summary to obtain information about model performance, the glm model captures a moderate amount of variance within the data. The R-squared value is relatively low, 0.39, but the RMSE is also low at 0.0063.
+
+```{r}
+predicted_values <- predict(glm_model, type = "response")
+
+# Create a dataframe containing observed and predicted values
+accuracy_data <- data.frame(Observed = metrics$mean_npp, Predicted = predicted_values)
+
+rsquared <- cor(accuracy_data$Observed, accuracy_data$Predicted)^2
+rmse <- sqrt(mean((accuracy_data$Observed - accuracy_data$Predicted)^2))
+
+# Plot accuracy
+accuracy_plot <- ggplot(accuracy_data, aes(x = Observed, y = Predicted)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red") +
+  annotate("text", x = min(accuracy_data$Observed), y = max(accuracy_data$Predicted), 
+           label = paste("R-squared:", round(rsquared, 4), "\nRMSE:", round(rmse, 4)), 
+           hjust = 0, vjust = 1, size = 4) +
+  labs(x = "Observed NPP (gCm2/yr)",
+       y = "Predicted (gCm2/yr)", 
+       title = "GLM Model Accuracy") +
+  theme_minimal()
+
+accuracy_plot
+```
+
+# Applying model to study area
+
+Applying this model was relatively simple after calculating metrics for the entire lidar file. While the model performance isn't very good, I was able to spatially view the predictions for NPP across the entire study area.
+
+```{r}
+library(tmap) # using tmap to map prediction raster
+
+# Compute metrics for the entire normalized las file
+custom_metrics <- function(x) { # user-defined function
+  list(
+     Mean_Height = mean(x),
+     Max_Height = max(x),   # max height
+     Std_Dev = sd(x),     # vertical variability of points
+     Height_90th_Percentile = quantile(x, probs = 0.9),
+     Skewness = skewness(x),
+     Kurtosis = kurtosis(x)
+   )
+}
+
+p_metrics <-pixel_metrics(nlas, ~custom_metrics(Z), 1) 
+
+predictor_metrics <- p_metrics[[c("Max_Height", "Skewness", "Kurtosis")]]
+
+# Apply model to rasterized metrics
+prediction <- predict(p_metrics, glm_model)
+
+predict_map <- tm_shape(prediction) +
+  tm_raster(title = "NPP Prediction") 
+
+max_height <- tm_shape(predictor_metrics$Max_Height) +
+  tm_raster(title = "Max Height")  
+
+skew <- tm_shape(predictor_metrics$Skewness) +
+  tm_raster(title = "Skewness")  
+
+kurt <- tm_shape(predictor_metrics$Kurtosis) +
+  tm_raster(title = "Kurtosis")  
+
+# Arrange plots
+tmap_arrange(predict_map, max_height, skew, kurt)
+
+plot(p_metrics)
+
+```
+
+# Reflection and Discussion
+
+While the model I implemented was somewhat of a weak model, it was able to produce results at a fine scale of NPP (1 meter). If I were to change the resolution of the prediction raster to 10 meters, it might have impacted the model performance. From my predictor variables, Skewness, Kurtosis and D5 / D6 metrics had the biggest influence of NPP.
